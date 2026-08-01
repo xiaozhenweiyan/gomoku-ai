@@ -124,14 +124,19 @@ const GomokuAnalysis = (function () {
   }
 
   // ===================================================================
-  // Top5 推荐引擎（按用户优先级分层 + 同点多次累加规则）
+  // Top5 推荐引擎（按用户优先级分层 + 同点多次累加规则 + 额外机制）
   //
   // 分档与分值（由高到低）：
   //   高分(h)：连五100000 / 阻挡连五99000 / 活四·阻挡活四10000 / 活三·阻挡活三5000
+  //            活三→连五 潜力2000 / 阻止对方活三→连五 2000
   //   中分(m)：眠四·阻挡眠四1000 / 眠三·阻挡眠三500
-  //   低分(l)：活二100 / 落在对方子的斜对角50
+  //            活二→活四 潜力800 / 阻止对方活二→活四 800
+  //            活二→眠四 潜力400 / 阻止对方活二→眠四 400
+  //            攻守兼备奖励 1500（同时进攻高分+防守高分）
+  //   低分(l)：活二100 / 落在对方子的斜对角50 / 己方邻子支援 +5/个
   //   极低(vl)：落在对方子的左右(正交)15 / 落在正中间10
   //   无用：0
+  //   扣分：被对方包围（2格内对方≥2且无己方支援）每个对方子 -4
   //
   // 同点累加（同一个点可多次加分，取其能形成的最大价值）：
   //   n 个高分  → 高分之和 × n
@@ -155,6 +160,9 @@ const GomokuAnalysis = (function () {
   const OFF_MAP = { '连五': ['h', 100000], '活四': ['h', 10000], '活三': ['h', 5000], '眠四': ['m', 1000], '眠三': ['m', 500], '活二': ['l', 100] };
   // 防守棋型（对方在此能形成的棋型 → 我方阻挡的价值）→ (档位, 分值)
   const DEF_MAP = { '连五': ['h', 99000], '活四': ['h', 10000], '活三': ['h', 5000], '眠四': ['m', 1000], '眠三': ['m', 500] };
+  // 潜在威胁（续手升级路径）→ (档位, 分值)
+  const THREAT_OFF = { '活二→活四': ['m', 800], '活二→眠四': ['m', 400], '活三→连五': ['h', 2000] };
+  const THREAT_DEF = { '活二→活四': ['m', 800], '活二→眠四': ['m', 400], '活三→连五': ['h', 2000] };
 
   // 9 格窗口（中心为落子点），两端补 '2'；返回长度 11，落子点在索引 5
   function windowStr(board, x, y, player, dx, dy) {
@@ -192,16 +200,49 @@ const GomokuAnalysis = (function () {
     return counts;
   }
 
-  // 单点总价值：进攻 + 防守 + 位置加成，按累加公式合成
+  // 潜在威胁检测：落子后是否存在"续手"使棋型升级
+  //   活二 → 续手能升级为活四/眠四
+  //   活三 → 续手能升级为连五
+  // 前提：board[x][y] 已是 player
+  function potentialThreats(board, x, y, player) {
+    const baseP = patternsThrough(board, x, y, player);
+    const has2 = (baseP['活二'] || 0) > 0;
+    const has3 = (baseP['活三'] || 0) > 0;
+    const res = {};
+    if (!has2 && !has3) return res;
+    for (const [dx, dy] of DIRS4) {
+      for (let i = -4; i <= 4; i++) {
+        if (i === 0) continue;
+        const sx = x + dx * i, sy = y + dy * i;
+        if (sx < 0 || sx >= SIZE || sy < 0 || sy >= SIZE) continue;
+        if (board[sx][sy] !== EMPTY) continue;
+        board[sx][sy] = player;
+        const p = patternsThrough(board, x, y, player); // 续手后原点参与的棋型
+        board[sx][sy] = EMPTY;
+        if (has2) {
+          if ((p['活四'] || 0) > (baseP['活四'] || 0)) res['活二→活四'] = (res['活二→活四'] || 0) + 1;
+          else if ((p['眠四'] || 0) > (baseP['眠四'] || 0)) res['活二→眠四'] = (res['活二→眠四'] || 0) + 1;
+        }
+        if (has3 && (p['连五'] || 0) > (baseP['连五'] || 0)) res['活三→连五'] = (res['活三→连五'] || 0) + 1;
+      }
+    }
+    return res;
+  }
+
+  // 单点总价值：进攻 + 防守 + 潜在威胁 + 邻里 + 位置加成，按累加公式合成
   function pointValue(board, x, y, player) {
     const opp = player === BLACK ? WHITE : BLACK;
     // 进攻：自己落子形成的棋型
     board[x][y] = player;
     const off = patternsThrough(board, x, y, player);
+    // 进攻潜在威胁：落子后是否存在续手升级路径
+    const offThreat = potentialThreats(board, x, y, player);
     board[x][y] = EMPTY;
     // 防守：对方若落子于此形成的棋型（= 我方阻挡掉的价值）
     board[x][y] = opp;
     const def = patternsThrough(board, x, y, opp);
+    // 防守潜在威胁：阻止对方续手升级路径
+    const defThreat = potentialThreats(board, x, y, opp);
     board[x][y] = EMPTY;
 
     const tiers = { h: { sum: 0, n: 0 }, m: { sum: 0, n: 0 }, l: { sum: 0, n: 0 }, vl: { sum: 0, n: 0 } };
@@ -210,6 +251,24 @@ const GomokuAnalysis = (function () {
     let offRaw = 0, defRaw = 0; // 原始进攻/防守分（用于 UI 展示）
     for (const [name, cnt] of Object.entries(off)) { const info = OFF_MAP[name]; if (!info) continue; for (let i = 0; i < cnt; i++) { add(info[0], info[1]); offRaw += info[1]; } }
     for (const [name, cnt] of Object.entries(def)) { const info = DEF_MAP[name]; if (!info) continue; for (let i = 0; i < cnt; i++) { add(info[0], info[1]); defRaw += info[1]; } }
+    // 潜在威胁计入累加
+    for (const [name, cnt] of Object.entries(offThreat)) { const info = THREAT_OFF[name]; if (!info) continue; for (let i = 0; i < cnt; i++) { add(info[0], info[1]); offRaw += info[1]; } }
+    for (const [name, cnt] of Object.entries(defThreat)) { const info = THREAT_DEF[name]; if (!info) continue; for (let i = 0; i < cnt; i++) { add(info[0], info[1]); defRaw += info[1]; } }
+
+    // ① 邻里密度机制：落点周围2格内己方/对方棋子
+    let myNeighbors = 0, oppNeighbors = 0;
+    for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE) continue;
+      if (board[nx][ny] === player) myNeighbors++;
+      else if (board[nx][ny] === opp) oppNeighbors++;
+    }
+    // 己方支援：每个邻格己方子 +5（低分档）
+    for (let i = 0; i < myNeighbors; i++) add('l', 5);
+
+    // ③ 攻守兼备奖励（我的想法）：同时具备进攻高分(≥活三5000)和防守高分(≥阻挡活三5000)
+    if (offRaw >= 5000 && defRaw >= 5000) add('m', 1500);
 
     // 位置加成
     // 斜对角：4 个对角邻格有对方子 → 低分(50)
@@ -233,6 +292,10 @@ const GomokuAnalysis = (function () {
     if (m.n) total += m.sum * (m.n / 2);
     if (l.n) total += l.sum + l.n;
     if (vl.n) total += vl.sum + (vl.n / 2);
+
+    // ① 被对方包围扣分：2格内对方子≥2且无己方支援 → 每个对方子 -4
+    if (myNeighbors === 0 && oppNeighbors >= 2) total -= oppNeighbors * 4;
+
     return { total: Math.round(total), off: offRaw, def: defRaw };
   }
 
