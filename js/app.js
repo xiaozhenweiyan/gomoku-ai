@@ -238,7 +238,7 @@
     $('sitBlack').style.width = bp + '%';
     $('sitWhite').style.width = (100 - bp) + '%';
     let verdict;
-    if (ev.black === 0 && ev.white === 0) verdict = '均势 · 等待开局';
+    if (ev.black === 0 && ev.white === 0) verdict = State.history.length === 0 ? '均势 · 等待开局' : '均势';
     else {
       const d = ev.net;
       if (Math.abs(d) < Math.max(50, total * 0.05)) verdict = '均势';
