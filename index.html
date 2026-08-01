@@ -3,44 +3,51 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>五子棋 · AI 智能解说</title>
+<title>围棋·五子不朽 · AI 对弈</title>
 <link rel="stylesheet" href="style.css" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 </head>
 <body>
 <div class="app">
-  <!-- 顶栏 -->
   <header class="topbar">
     <div class="brand">
       <span class="logo">⚫⚪</span>
-      <h1>五子棋 <small>AI 智能解说</small></h1>
+      <h1>围棋·五子不朽 <small>AI 对弈</small></h1>
     </div>
     <div class="topbar-right">
-      <label class="model-switch" title="切换 AI 模型">
-        <select id="modelSelect">
-          <option value="deepseek-chat">V4 Flash · 快速</option>
-          <option value="deepseek-reasoner">V4 Pro · 深度思考</option>
-        </select>
+      <label class="ai-toggle" title="AI 对手开关">
+        <input type="checkbox" id="aiEnable" checked /> <span>AI 执白</span>
       </label>
+      <select id="modelSelect">
+        <option value="deepseek-chat">V4 Flash · 快速解说</option>
+        <option value="deepseek-reasoner">V4 Pro · 深度思考</option>
+      </select>
       <button id="settingsBtn" class="btn ghost">API 设置</button>
+      <button id="rulesBtn" class="btn ghost">规则设置</button>
     </div>
   </header>
 
   <main class="main">
-    <!-- 左：棋盘 + 分析 -->
     <section class="board-area">
       <div class="board-wrap" id="boardWrap">
-        <canvas id="board" width="600" height="600"></canvas>
+        <canvas id="board" width="760" height="760"></canvas>
         <div class="hover-coord" id="hoverCoord"></div>
       </div>
 
-      <!-- 实时形势条 -->
+      <!-- AI 评估进度 -->
+      <div class="ai-progress" id="aiProgress" style="display:none">
+        <div class="ai-progress-bar"><div class="ai-progress-fill" id="aiProgressFill"></div></div>
+        <span class="ai-progress-text" id="aiProgressText">正在评估局面…</span>
+      </div>
+
+      <!-- 实时形势 -->
       <div class="situation">
         <div class="sit-label">
-          <span class="dot black"></span>黑方 <b id="blackScore">0</b>
+          <span class="dot black"></span>黑 <b id="blackScore">0</b> 目
           <span class="sit-vs">vs</span>
-          <b id="whiteScore">0</b> 白方<span class="dot white"></span>
+          <b id="whiteScore">0</b> 目 白<span class="dot white"></span>
+          <span class="immortal-tag" id="immortalTag"></span>
         </div>
         <div class="sit-bar">
           <div class="sit-bar-black" id="sitBlack" style="width:50%"></div>
@@ -49,22 +56,20 @@
         <div class="sit-verdict" id="sitVerdict">均势 · 等待开局</div>
       </div>
 
-      <!-- 控制按钮 -->
       <div class="controls">
         <button id="undoBtn" class="btn">↶ 悔棋</button>
+        <button id="passBtn" class="btn">⊘ 弃权</button>
         <button id="restartBtn" class="btn">⟳ 重新开始</button>
         <button id="analyzeBtn" class="btn primary">⚡ 分析最优下法</button>
         <button id="clearMarksBtn" class="btn">✕ 清除标记</button>
       </div>
 
-      <!-- 形势折线图 -->
       <div class="chart-box">
-        <div class="chart-title">形势折线图 <small>每一手双方积分变化（对数压缩刻度）</small></div>
+        <div class="chart-title">形势折线图 <small>每一手双方目数变化（对数压缩刻度）</small></div>
         <div class="chart-canvas-wrap"><canvas id="sitChart"></canvas></div>
       </div>
     </section>
 
-    <!-- 右：AI 对话 -->
     <aside class="chat-area">
       <div class="chat-head">
         <span>💬 AI 解说与对话</span>
@@ -73,7 +78,7 @@
       <div class="chat-body" id="chatBody">
         <div class="msg ai">
           <div class="msg-author">AI 解说</div>
-          <div class="msg-text">欢迎来到五子棋对弈。黑方先行，点击棋盘交叉点落子。每步我都会结合实时分析进行点评；右侧可随时向我提问。</div>
+          <div class="msg-text">欢迎来到<b>围棋·五子不朽</b>。19×19 棋盘，黑方先行。规则融合围棋（气/提子/领地）与五子棋（连五触发不朽块）。连成五子后整个连通棋块变为不朽，永久存活且围住的空点锁定为该方领地。在右上「规则设置」选择平衡规则后开始对弈。</div>
         </div>
       </div>
       <div class="chat-input">
@@ -85,33 +90,37 @@
   </main>
 </div>
 
-<!-- API 设置 弹窗 -->
+<!-- 规则设置弹窗 -->
+<div class="modal-mask" id="rulesModal">
+  <div class="modal">
+    <div class="modal-head"><h3>规则设置</h3><button id="closeRules" class="x">✕</button></div>
+    <div class="modal-body">
+      <div class="hint">至少启用一项平衡规则（用于约束不朽块的强度）。</div>
+      <label class="rule-item"><input type="checkbox" id="ruleMaxSize" checked /> <span><b>不朽块大小限制</b>（≤20子）<br><small>超过20子则连五不触发不朽，防止早期巨厚势无敌</small></span></label>
+      <label class="rule-item"><input type="checkbox" id="ruleNoAdj" /> <span><b>不朽块邻接限制</b><br><small>对方不可紧邻不朽块落子（除非自己也能连五）</small></span></label>
+      <label class="rule-item"><input type="checkbox" id="ruleOneImmortal" checked /> <span><b>单方仅1个不朽块</b><br><small>同一方后续连五不再触发不朽</small></span></label>
+      <label class="rule-item"><input type="checkbox" id="ruleStoneNoScore" checked /> <span><b>不朽块棋子不计目</b><br><small>终局只算围住的空点，棋子本身不计目</small></span></label>
+      <div class="modal-row"><button id="applyRules" class="btn primary">应用规则</button><span id="ruleMsg" class="test-result"></span></div>
+    </div>
+  </div>
+</div>
+
+<!-- API 设置弹窗 -->
 <div class="modal-mask" id="settingsModal">
   <div class="modal">
-    <div class="modal-head">
-      <h3>API 设置</h3>
-      <button id="closeSettings" class="x">✕</button>
-    </div>
+    <div class="modal-head"><h3>API 设置</h3><button id="closeSettings" class="x">✕</button></div>
     <div class="modal-body">
-      <label>DeepSeek API Key</label>
+      <label>DeepSeek API Key（用于 AI 解说与对话，可选）</label>
       <input type="password" id="apiKeyInput" placeholder="sk-..." autocomplete="off" />
-      <div class="hint">密钥仅保存在你的浏览器本地（localStorage），不会上传到任何服务器。</div>
-      <div class="modal-row">
-        <button id="testBtn" class="btn">🔍 测试连接</button>
-        <span id="testResult" class="test-result"></span>
-      </div>
-      <div class="modal-row">
-        <button id="saveKeyBtn" class="btn primary">保存</button>
-      </div>
-      <div class="model-info">
-        模型映射：V4 Flash → <code>deepseek-chat</code> · V4 Pro → <code>deepseek-reasoner</code>
-      </div>
+      <div class="hint">密钥仅保存在浏览器本地。未配置时对弈、AI落子、形势分析正常，仅解说/对话功能不可用。</div>
+      <div class="modal-row"><button id="testBtn" class="btn">🔍 测试连接</button><span id="testResult" class="test-result"></span></div>
+      <div class="modal-row"><button id="saveKeyBtn" class="btn primary">保存</button></div>
+      <div class="model-info">模型映射：V4 Flash → <code>deepseek-chat</code> · V4 Pro → <code>deepseek-reasoner</code></div>
     </div>
   </div>
 </div>
 
 <div class="toast" id="toast"></div>
-
 <script src="js/analysis.js"></script>
 <script src="js/app.js"></script>
 </body>

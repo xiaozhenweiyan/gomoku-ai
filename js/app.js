@@ -1,598 +1,449 @@
 /* =====================================================================
- * app.js — 五子棋主程序：棋盘渲染 / 对弈 / 形势 / AI 解说与对话
- * 依赖：GomokuAnalysis(analysis.js)、Chart.js、marked.js
+ * GoImmortal — 应用主逻辑
+ * 棋盘渲染 / 落子提子 / 不朽块 / 异步MCTS / 形势图 / AI解说
  * ===================================================================== */
-(() => {
-  const GA = GomokuAnalysis;
-  const SIZE = GA.SIZE;
-  const BLACK = GA.BLACK, WHITE = GA.WHITE;
+const { SIZE, EMPTY, BLACK, WHITE } = GoImmortal;
+const coord = (x, y) => String.fromCharCode(65 + x) + (SIZE - y);
+const parseCoord = s => { const x = s.charCodeAt(0) - 65, y = SIZE - parseInt(s.slice(1)); return [x, y]; };
 
-  // ---------- 工具：坐标 ----------
-  const letterOf = (x) => String.fromCharCode(65 + x);       // 0->A ... 14->O
-  const numberOf = (y) => 15 - y;                            // 0->15(顶) ... 14->1(底)
-  const coordOf = (x, y) => letterOf(x) + numberOf(y);
+// ---- 状态 ----
+let board = GoImmortal.emptyBoard();
+let currentPlayer = BLACK;
+let history = [];          // {board, player, ko, state, passCount}
+let koPoint = null;
+let passCount = 0;
+let gameOver = false;
+let marks = [];            // 分析高亮 [{x,y,color}]
+let lastMove = null;       // [x,y]
+let winLine = null;        // 连五连线
+let immortalMap = new Map();
+let sideImmortal = new Set();
+let aiThinking = false;
+let stopStream = false;
+let rules = { maxImmortalSize: 20, noAdjImmortal: false, oneImmortalPerSide: true, stoneNoScore: true };
+let chart = null;
+let chartData = { labels: [], black: [], white: [] };
+let chatHistory = [];      // {role, content}
 
-  // ---------- 游戏状态 ----------
-  const State = {
-    board: emptyBoard(),
-    history: [],          // {x,y,player}
-    current: BLACK,
-    over: false,
-    winner: 0,
-    winLine: null,
-    marks: [],            // [{x,y,rank,score}] Top5 高亮
-    scoreHistory: [{ move: 0, black: 0, white: 0, net: 0 }],
-    lastTop5Note: null,
-  };
-  function emptyBoard() { return Array.from({ length: SIZE }, () => Array(SIZE).fill(0)); }
+// ---- DOM ----
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const hoverCoord = document.getElementById('hoverCoord');
+const aiProgress = document.getElementById('aiProgress');
+const aiProgressFill = document.getElementById('aiProgressFill');
+const aiProgressText = document.getElementById('aiProgressText');
+const chatBody = document.getElementById('chatBody');
+const chatInput = document.getElementById('chatInput');
+const chatStatus = document.getElementById('chatStatus');
+const stopBtn = document.getElementById('stopBtn');
+const toast = document.getElementById('toast');
 
-  // ---------- DOM ----------
-  const $ = (id) => document.getElementById(id);
-  const canvas = $('board'), ctx = canvas.getContext('2d');
-  const hoverCoord = $('hoverCoord');
-  const chatBody = $('chatBody'), chatInput = $('chatInput');
-  const stopBtn = $('stopBtn'), sendBtn = $('sendBtn');
-  const chatStatus = $('chatStatus');
-  const modelSelect = $('modelSelect');
+// ---- 棋盘渲染参数 ----
+const MARGIN = 28;
+const CELL = (760 - MARGIN * 2) / (SIZE - 1);
+const STONE_R = CELL * 0.46;
 
-  // ---------- 棋盘渲染 ----------
-  let cell = 0, margin = 0, cssSize = 0;
-  const STAR = [[3, 3], [3, 7], [3, 11], [7, 3], [7, 7], [7, 11], [11, 3], [11, 7], [11, 11]];
+function px(i) { return MARGIN + i * CELL; }
+function fromPx(p) { return Math.round((p - MARGIN) / CELL); }
 
-  function resizeCanvas() {
-    const wrap = $('boardWrap');
-    cssSize = wrap.clientWidth - 16; // padding 8*2
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = cssSize * dpr;
-    canvas.height = cssSize * dpr;
-    canvas.style.width = cssSize + 'px';
-    canvas.style.height = cssSize + 'px';
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    margin = cssSize * 0.045;
-    cell = (cssSize - 2 * margin) / 14;
-    draw();
+function drawBoard() {
+  const W = canvas.width, H = canvas.height;
+  // 棋盘底色
+  ctx.fillStyle = '#dcb573';
+  ctx.fillRect(0, 0, W, H);
+  // 木纹噪点
+  ctx.fillStyle = 'rgba(120,80,30,0.04)';
+  for (let i = 0; i < 400; i++) ctx.fillRect(Math.random() * W, Math.random() * H, 2, 1);
+  // 网格线
+  ctx.strokeStyle = '#3a2a18';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < SIZE; i++) {
+    ctx.beginPath(); ctx.moveTo(px(0), px(i)); ctx.lineTo(px(SIZE - 1), px(i)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(px(i), px(0)); ctx.lineTo(px(i), px(SIZE - 1)); ctx.stroke();
   }
-  function px(x) { return margin + x * cell; }
-  function py(y) { return margin + y * cell; }
-
-  function draw() {
-    ctx.clearRect(0, 0, cssSize, cssSize);
-    // 木色底
-    const g = ctx.createLinearGradient(0, 0, cssSize, cssSize);
-    g.addColorStop(0, '#e0bd86'); g.addColorStop(1, '#cf9e5f');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, cssSize, cssSize);
-
-    // 网格
-    ctx.strokeStyle = 'rgba(40,25,10,.55)';
-    ctx.lineWidth = 1;
-    for (let i = 0; i < SIZE; i++) {
-      ctx.beginPath(); ctx.moveTo(px(0), py(i)); ctx.lineTo(px(14), py(i)); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(px(i), py(0)); ctx.lineTo(px(i), py(14)); ctx.stroke();
-    }
-    // 星位
-    ctx.fillStyle = 'rgba(40,25,10,.7)';
-    for (const [sx, sy] of STAR) { ctx.beginPath(); ctx.arc(px(sx), py(sy), Math.max(2.2, cell * 0.07), 0, 7); ctx.fill(); }
-
-    // 坐标标注
-    ctx.fillStyle = 'rgba(60,40,15,.75)';
-    ctx.font = `${Math.max(9, cell * 0.28)}px sans-serif`;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    for (let i = 0; i < SIZE; i++) {
-      ctx.fillText(letterOf(i), px(i), margin * 0.45);
-      ctx.fillText(letterOf(i), px(i), cssSize - margin * 0.45);
-      ctx.fillText(String(numberOf(i)), margin * 0.45, py(i));
-      ctx.fillText(String(numberOf(i)), cssSize - margin * 0.45, py(i));
-    }
-
-    // 标记 Top5
-    drawMarks();
-    // 棋子
-    for (let x = 0; x < SIZE; x++) for (let y = 0; y < SIZE; y++) {
-      if (State.board[x][y] !== 0) drawStone(x, y, State.board[x][y], false);
-    }
-    // 最后一步标记
-    const last = State.history[State.history.length - 1];
-    if (last && !State.over) {
-      ctx.fillStyle = '#ef5b5b';
-      ctx.beginPath(); ctx.arc(px(last.x), py(last.y), cell * 0.1, 0, 7); ctx.fill();
-    }
-    // 获胜连线
-    if (State.winLine) drawWinLine();
+  // 星位（19路：天元 + 4角3-3 + 4边中点）
+  const stars = [[3,3],[9,3],[15,3],[3,9],[15,9],[3,15],[9,15],[15,15],[9,9]];
+  ctx.fillStyle = '#2a1a0a';
+  for (const [sx, sy] of stars) { ctx.beginPath(); ctx.arc(px(sx), px(sy), 3.5, 0, 7); ctx.fill(); }
+  // 坐标
+  ctx.fillStyle = '#5a4220';
+  ctx.font = '11px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (let i = 0; i < SIZE; i++) {
+    ctx.fillText(String.fromCharCode(65 + i), px(i), 12);
+    ctx.fillText(String(SIZE - i), 12, px(i));
   }
-
-  function drawStone(x, y, color, ghost) {
-    const r = cell * 0.43;
-    const cx = px(x), cy = py(y);
-    ctx.save();
-    ctx.globalAlpha = ghost ? 0.42 : 1;
-    // 阴影
-    if (!ghost) { ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.beginPath(); ctx.arc(cx + 1.5, cy + 2, r, 0, 7); ctx.fill(); }
-    if (color === BLACK) {
-      const gr = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.1, cx, cy, r);
-      gr.addColorStop(0, '#5a5a5a'); gr.addColorStop(0.4, '#1c1c1c'); gr.addColorStop(1, '#000');
-      ctx.fillStyle = gr;
-    } else {
-      const gr = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.1, cx, cy, r);
-      gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.7, '#eceef2'); gr.addColorStop(1, '#c7cbd3');
-      ctx.fillStyle = gr;
-    }
-    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
-    ctx.lineWidth = 0.8; ctx.strokeStyle = color === BLACK ? 'rgba(0,0,0,.6)' : 'rgba(120,120,130,.5)';
-    ctx.stroke();
-    ctx.restore();
+  // 棋子
+  for (let x = 0; x < SIZE; x++) for (let y = 0; y < SIZE; y++) {
+    if (board[x][y] === EMPTY) continue;
+    drawStone(x, y, board[x][y]);
   }
-
-  function drawMarks() {
-    State.marks.forEach((m, i) => {
-      const cx = px(m.x), cy = py(m.y), r = cell * 0.34;
-      const colors = ['#ef5b5b', '#f0a93b', '#3ec77a', '#5b8cff', '#b07cff'];
-      const c = colors[i] || '#888';
-      ctx.save();
-      ctx.globalAlpha = 0.92;
-      ctx.strokeStyle = c; ctx.lineWidth = 2.4;
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.stroke();
-      ctx.fillStyle = c; ctx.globalAlpha = 0.95;
-      ctx.font = `bold ${Math.max(10, cell * 0.32)}px sans-serif`;
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(String(i + 1), cx, cy);
-      ctx.restore();
-    });
+  // 不朽块标记环
+  ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5;
+  for (const [k, c] of immortalMap) {
+    const x = k % SIZE, y = Math.floor(k / SIZE);
+    ctx.beginPath(); ctx.arc(px(x), px(y), STONE_R + 3, 0, 7); ctx.stroke();
   }
-
-  function drawWinLine() {
-    const a = State.winLine[0], b = State.winLine[State.winLine.length - 1];
-    ctx.save();
-    ctx.strokeStyle = 'rgba(239,91,91,.9)'; ctx.lineWidth = cell * 0.16; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(px(a[0]), py(a[1])); ctx.lineTo(px(b[0]), py(b[1])); ctx.stroke();
-    for (const [x, y] of State.winLine) {
-      ctx.strokeStyle = '#ef5b5b'; ctx.lineWidth = 2.5;
-      ctx.beginPath(); ctx.arc(px(x), py(y), cell * 0.5, 0, 7); ctx.stroke();
-    }
-    ctx.restore();
+  // 最后一手标记
+  if (lastMove) {
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(px(lastMove[0]), px(lastMove[1]), STONE_R * 0.4, 0, 7); ctx.stroke();
   }
-
-  // 鼠标悬停
-  let hoverCell = null;
-  function hoverPos(clientX, clientY) {
-    const rect = canvas.getBoundingClientRect();
-    const mx = clientX - rect.left, my = clientY - rect.top;
-    const x = Math.round((mx - margin) / cell), y = Math.round((my - margin) / cell);
-    if (x < 0 || x > 14 || y < 0 || y > 14) return null;
-    return [x, y];
+  // 连五获胜线
+  if (winLine) {
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(px(winLine[0][0]), px(winLine[0][1]));
+    ctx.lineTo(px(winLine[4][0]), px(winLine[4][1])); ctx.stroke();
   }
-  canvas.addEventListener('mousemove', (e) => {
-    const c = hoverPos(e.clientX, e.clientY);
-    if (!c) { hoverCoord.classList.remove('show'); hoverCell = null; return; }
-    hoverCell = c;
-    hoverCoord.textContent = coordOf(c[0], c[1]) + (State.over ? '' : ' · ' + (State.current === BLACK ? '黑' : '白') + '落子');
-    hoverCoord.classList.add('show');
-    drawGhost();
+  // 分析标记
+  for (const m of marks) {
+    ctx.strokeStyle = m.color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(px(m.x), px(m.y), STONE_R * 0.55, 0, 7); ctx.stroke();
+  }
+}
+
+function drawStone(x, y, color) {
+  const cx = px(x), cy = px(y), r = STONE_R;
+  // 阴影
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath(); ctx.arc(cx + 1.5, cy + 2, r, 0, 7); ctx.fill();
+  // 棋子
+  const grad = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.1, cx, cy, r);
+  if (color === BLACK) { grad.addColorStop(0, '#555'); grad.addColorStop(1, '#0a0a0a'); }
+  else { grad.addColorStop(0, '#fff'); grad.addColorStop(1, '#c8c8c8'); }
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+}
+
+// ---- 鼠标交互 ----
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const sy = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const x = fromPx(sx), y = fromPx(sy);
+  if (x >= 0 && x < SIZE && y >= 0 && y < SIZE) hoverCoord.textContent = coord(x, y);
+  else hoverCoord.textContent = '';
+});
+canvas.addEventListener('mouseleave', () => hoverCoord.textContent = '');
+canvas.addEventListener('click', e => {
+  if (gameOver || aiThinking) return;
+  if (document.getElementById('aiEnable').checked && currentPlayer === WHITE) return; // AI回合
+  const rect = canvas.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const sy = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const x = fromPx(sx), y = fromPx(sy);
+  if (x < 0 || x >= SIZE || y < 0 || y >= SIZE) return;
+  doMove(x, y);
+});
+
+// ---- 落子核心 ----
+function getState() { return { immortalMap, sideImmortal }; }
+
+function doMove(x, y, isPass = false) {
+  if (gameOver) return;
+  if (!isPass && board[x][y] !== EMPTY) { showToast('该点已有棋子', true); return; }
+  // 保存历史用于悔棋
+  history.push({
+    board: GoImmortal.cloneBoard(board), player: currentPlayer,
+    ko: koPoint, state: { immortalMap: new Map(immortalMap), sideImmortal: new Set(sideImmortal) },
+    passCount, lastMove: lastMove ? [...lastMove] : null, winLine
   });
-  canvas.addEventListener('mouseleave', () => { hoverCoord.classList.remove('show'); hoverCell = null; draw(); });
-  function drawGhost() {
-    draw();
-    if (hoverCell && !State.over && State.board[hoverCell[0]][hoverCell[1]] === 0) {
-      drawStone(hoverCell[0], hoverCell[1], State.current, true);
-    }
+  if (isPass) {
+    passCount++;
+    addChat('ai', `<b>${currentPlayer === BLACK ? '黑' : '白'}方弃权</b>（连续弃权 ${passCount}/2）`);
+    if (GoImmortal.isGameOver(board, passCount)) { endGame(); return; }
+    nextTurn();
+    return;
   }
-  canvas.addEventListener('click', (e) => {
-    const c = hoverPos(e.clientX, e.clientY);
-    if (c) placeMove(c[0], c[1]);
-  });
-  // 触摸
-  canvas.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    const t = e.touches[0]; const c = hoverPos(t.clientX, t.clientY);
-    if (c) placeMove(c[0], c[1]);
-  }, { passive: false });
-
-  // ---------- 落子主流程 ----------
-  function placeMove(x, y) {
-    if (State.over) { toast('对局已结束，请点击「重新开始」'); return; }
-    if (State.board[x][y] !== 0) return;
-    const mover = State.current;
-
-    // 落子前的 Top5（用于点评：本手是否在推荐之列）
-    State.board[x][y] = mover;
-    State.history.push({ x, y, player: mover });
-    State.board[x][y] = 0; // 临时还原算 pre-move 推荐
-    const preTop5 = GA.recommend(State.board, mover);
-    State.board[x][y] = mover; // 恢复
-
-    const inTop = preTop5.findIndex(r => r.x === x && r.y === y);
-    const moveInfo = { x, y, player: mover, coord: coordOf(x, y), preTop5, inTop };
-
-    // 胜负
-    const win = GA.checkWin(State.board, x, y);
-    if (win) {
-      State.over = true; State.winner = mover; State.winLine = win;
-    } else if (GA.isBoardFull(State.board)) {
-      State.over = true; State.winner = 0; // 平局
-    }
-
-    // 形势
-    const ev = GA.evaluate(State.board);
-    State.scoreHistory.push({ move: State.history.length, black: ev.black, white: ev.white, net: ev.net });
-    updateSituation(ev);
-    refreshChart();
-
-    // 清除上轮分析标记
-    State.marks = [];
-    draw();
-
-    // 切换玩家
-    if (!State.over) State.current = mover === BLACK ? WHITE : BLACK;
-
-    // AI 解说
-    runCommentary(moveInfo, ev);
+  const r = GoImmortal.tryMove(board, x, y, currentPlayer, rules, getState(), koPoint);
+  if (!r.ok) { showToast(r.reason, true); history.pop(); return; }
+  board = r.board;
+  koPoint = r.koPoint;
+  lastMove = [x, y];
+  passCount = 0;
+  // 不朽触发
+  if (r.immortalTriggered) {
+    r.immortalStones.forEach(([sx, sy]) => immortalMap.set(sy * SIZE + sx, currentPlayer));
+    sideImmortal.add(currentPlayer);
+    const line = GoImmortal.findFiveLine(board, x, y, currentPlayer);
+    winLine = line;
+    addChat('ai', `<b>⚡ 连五不朽触发！</b>${currentPlayer === BLACK ? '黑' : '白'}方在 ${coord(x, y)} 连成五子，整个连通棋块（${r.immortalStones.length} 子）变为<b>不朽块</b>，永久存活且围住的空点锁定为领地。`);
   }
+  drawBoard();
+  updateSituation();
+  if (winLine) { setTimeout(() => endByImmortal(), 600); return; }
+  nextTurn();
+}
 
-  // ---------- 形势条 ----------
-  function updateSituation(ev) {
-    $('blackScore').textContent = ev.black;
-    $('whiteScore').textContent = ev.white;
-    const total = ev.black + ev.white;
-    let bp = total > 0 ? (ev.black / total) * 100 : 50;
-    if (ev.black === 0 && ev.white === 0) bp = 50;
-    bp = Math.max(4, Math.min(96, bp));
-    $('sitBlack').style.width = bp + '%';
-    $('sitWhite').style.width = (100 - bp) + '%';
-    let verdict;
-    if (ev.black === 0 && ev.white === 0) verdict = State.history.length === 0 ? '均势 · 等待开局' : '均势';
-    else {
-      const d = ev.net;
-      if (Math.abs(d) < Math.max(50, total * 0.05)) verdict = '均势';
-      else if (d > 0) verdict = d > total * 0.4 ? '黑棋明显优势' : '黑棋占优';
-      else verdict = -d > total * 0.4 ? '白棋明显优势' : '白棋占优';
-    }
-    if (State.over) {
-      if (State.winner === BLACK) verdict = '黑方获胜';
-      else if (State.winner === WHITE) verdict = '白方获胜';
-      else verdict = '和棋';
-    }
-    $('sitVerdict').textContent = verdict;
+function nextTurn() {
+  currentPlayer = currentPlayer === BLACK ? WHITE : BLACK;
+  if (!gameOver && document.getElementById('aiEnable').checked && currentPlayer === WHITE) {
+    setTimeout(() => aiTurn(), 200);
   }
+}
 
-  // ---------- 折线图 ----------
-  // Y 轴对数压缩：sign(x)*log1p(|x|)，避免五连(100000)把刻度撑爆、普通手被压成一条线。
-  // tooltip 仍显示真实积分。
-  const compress = (v) => Math.sign(v) * Math.log1p(Math.abs(v));
-  let chart;
-  function initChart() {
-    const c = $('sitChart').getContext('2d');
-    chart = new Chart(c, {
-      type: 'line',
-      data: {
-        labels: ['0'],
-        datasets: [
-          { label: '黑方积分', data: [0], borderColor: '#c9ccd6', backgroundColor: 'rgba(201,204,214,.12)', tension: .25, fill: false, pointRadius: 2, borderWidth: 2 },
-          { label: '白方积分', data: [0], borderColor: '#5b8cff', backgroundColor: 'rgba(91,140,255,.12)', tension: .25, fill: false, pointRadius: 2, borderWidth: 2 },
-        ],
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        plugins: {
-          legend: { labels: { color: '#9aa1b1', boxWidth: 12, font: { size: 11 } } },
-          tooltip: {
-            callbacks: {
-              label: (ctx) => {
-                const idx = ctx.dataIndex;
-                const real = State.scoreHistory[idx];
-                const who = ctx.datasetIndex === 0 ? '黑方' : '白方';
-                return `${who}：${real ? (ctx.datasetIndex === 0 ? real.black : real.white) : 0} 分`;
-              },
-              title: (items) => '第 ' + items[0].label + ' 手',
-            },
-          },
-        },
-        scales: {
-          x: { ticks: { color: '#6b7180', maxTicksLimit: 12 }, grid: { color: 'rgba(255,255,255,.05)' }, title: { display: true, text: '手数', color: '#6b7180' } },
-          y: { ticks: { color: '#6b7180', callback: (v) => Math.round(v) }, grid: { color: 'rgba(255,255,255,.05)' }, title: { display: true, text: '积分（对数压缩）', color: '#6b7180' } },
-        },
-      },
-    });
-  }
-  function refreshChart() {
-    chart.data.labels = State.scoreHistory.map(h => String(h.move));
-    chart.data.datasets[0].data = State.scoreHistory.map(h => compress(h.black));
-    chart.data.datasets[1].data = State.scoreHistory.map(h => compress(h.white));
+// ---- AI 回合（异步 MCTS，避免阻塞）----
+async function aiTurn() {
+  if (gameOver) return;
+  aiThinking = true;
+  showProgress(0, 20, '正在评估局面…');
+  // 让出主线程两帧，确保进度条先渲染出来
+  await new Promise(r => requestAnimationFrame(r));
+  await new Promise(r => requestAnimationFrame(r));
+  let lastProg = 0;
+  const result = GoImmortal.mcts(board, WHITE, rules, getState(), koPoint,
+    { simulations: 20, topK: 8 },
+    (p) => {
+      if (p.done - lastProg >= 4) { lastProg = p.done; showProgress(p.done, p.total, `正在评估局面… (${p.done}/${p.total})`); }
+    }
+  );
+  showProgress(20, 20, '评估完成，落子中…');
+  await new Promise(r => requestAnimationFrame(r));
+  hideProgress();
+  aiThinking = false;
+  if (result.pass || result.x < 0) { doMove(0, 0, true); return; }
+  doMove(result.x, result.y);
+  // AI 解说
+  commentMove(result.x, result.y, result.scores);
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function showProgress(done, total, text) {
+  aiProgress.style.display = 'flex';
+  aiProgressFill.style.width = `${(done / total) * 100}%`;
+  aiProgressText.textContent = text;
+}
+function hideProgress() { aiProgress.style.display = 'none'; }
+
+// ---- 形势更新 ----
+function updateSituation() {
+  const ev = GoImmortal.evaluate(board, immortalMap, rules);
+  document.getElementById('blackScore').textContent = ev.black;
+  document.getElementById('whiteScore').textContent = ev.white;
+  const total = ev.black + ev.white || 1;
+  document.getElementById('sitBlack').style.width = `${(ev.black / total) * 100}%`;
+  document.getElementById('sitWhite').style.width = `${(ev.white / total) * 100}%`;
+  let verdict = '均势';
+  if (ev.net > 30) verdict = '黑棋优势';
+  else if (ev.net > 10) verdict = '黑棋略优';
+  else if (ev.net < -30) verdict = '白棋优势';
+  else if (ev.net < -10) verdict = '白棋略优';
+  if (immortalMap.size > 0) {
+    const bk = [...immortalMap.values()].filter(v => v === BLACK).length;
+    const wk = [...immortalMap.values()].filter(v => v === WHITE).length;
+    document.getElementById('immortalTag').textContent = `不朽块 黑${bk}/白${wk}`;
+  } else document.getElementById('immortalTag').textContent = '';
+  document.getElementById('sitVerdict').textContent = `${verdict} · 黑领地${ev.blackTerr}目 / 白领地${ev.whiteTerr}目`;
+  // 折线图
+  chartData.labels.push(`第${history.length + 1}手`);
+  chartData.black.push(ev.black);
+  chartData.white.push(ev.white);
+  if (chart) {
+    chart.data.labels = chartData.labels;
+    chart.data.datasets[0].data = chartData.black.map(v => compress(v));
+    chart.data.datasets[1].data = chartData.white.map(v => compress(v));
     chart.update('none');
   }
+}
 
-  // ---------- AI ----------
-  const AI = {
-    apiKey: localStorage.getItem('ds_api_key') || '',
-    model: localStorage.getItem('ds_model') || 'deepseek-chat',
-    ctrl: null,
-  };
-  modelSelect.value = AI.model;
+// 对数压缩，避免五连/大领地撑爆刻度
+function compress(v) { const sign = v >= 0 ? 1 : -1; return sign * Math.log1p(Math.abs(v)); }
 
-  const MODEL_NAME = { 'deepseek-chat': 'V4 Flash', 'deepseek-reasoner': 'V4 Pro' };
+// ---- 终局 ----
+function endByImmortal() {
+  gameOver = true;
+  const ev = GoImmortal.evaluate(board, immortalMap, rules);
+  addChat('ai', `<b>🏁 连五不朽获胜！</b>${sideImmortal.has(BLACK) ? '黑' : '白'}方触发不朽块。<br>最终：黑 ${ev.black} 目 / 白 ${ev.white} 目。`);
+}
+function endGame() {
+  gameOver = true;
+  const ev = GoImmortal.evaluate(board, immortalMap, rules);
+  const winner = ev.net > 0 ? '黑' : ev.net < 0 ? '白' : '平';
+  addChat('ai', `<b>🏁 终局</b>（双方弃权）。<br>黑 ${ev.black} 目 / 白 ${ev.white} 目 → <b>${winner === '平' ? '和局' : winner + '方获胜'}</b>`);
+}
 
-  function isPro() { return AI.model === 'deepseek-reasoner'; }
+// ---- 分析最优下法 ----
+function analyzeBest() {
+  if (aiThinking) { showToast('AI 正在思考，请稍候', true); return; }
+  const result = GoImmortal.mcts(board, currentPlayer, rules, getState(), koPoint, { simulations: 30, topK: 10 });
+  marks = result.scores.slice(0, 5).map((s, i) => ({ x: s.x, y: s.y, color: ['#fbbf24', '#6ee7b7', '#4d9fff', '#a78bfa', '#f87171'][i] }));
+  drawBoard();
+  const text = result.scores.slice(0, 5).map((s, i) => `${i + 1}. ${coord(s.x, s.y)}（评分 ${Math.round(s.score)}）`).join('  ');
+  addChat('ai', `<b>最优下法 Top5</b>（当前${currentPlayer === BLACK ? '黑' : '白'}方）：<br>${text}`);
+}
 
-  // 棋盘文本（供 AI）
-  function boardText() {
-    let header = '    ' + Array.from({ length: SIZE }, (_, i) => letterOf(i)).join(' ');
-    let lines = [header];
-    for (let y = 0; y < SIZE; y++) {
-      let row = String(numberOf(y)).padStart(2, ' ') + '  ';
-      for (let x = 0; x < SIZE; x++) {
-        const v = State.board[x][y];
-        row += (v === BLACK ? 'X' : v === WHITE ? 'O' : '.') + ' ';
+// ---- AI 解说（DeepSeek 流式）----
+async function commentMove(x, y, scores) {
+  const apiKey = localStorage.getItem('deepseek_key');
+  if (!apiKey) return; // 无 Key 静默
+  const model = document.getElementById('modelSelect').value;
+  const ev = GoImmortal.evaluate(board, immortalMap, rules);
+  const top5 = scores.slice(0, 5).map((s, i) => `${i + 1}.${coord(s.x, s.y)}(${Math.round(s.score)})`).join(' ');
+  const boardText = boardTextForAI();
+  const sys = `你是围棋·五子不朽游戏的解说。规则：围棋气/提子/领地 + 连五触发不朽块。客观、简短（1-3句），平淡时一句话带过。绝不可把昏招说成妙手。结合当前目数差、不朽块、Top5推荐点点评。若落子不在Top5，委婉指出更优位置。`;
+  const user = `当前局面（${currentPlayer === BLACK ? '白' : '黑'}方刚下 ${coord(x, y)}，现轮${currentPlayer === BLACK ? '黑' : '白'}方）：\n黑${ev.black}目/白${ev.white}目，净差${ev.net}。不朽块${immortalMap.size}子。Top5推荐：${top5}\n棋盘：\n${boardText}`;
+  await streamChat([{ role: 'system', content: sys }, { role: 'user', content: user }], model, 'ai');
+}
+
+function boardTextForAI() {
+  let s = '   ';
+  for (let x = 0; x < SIZE; x++) s += String.fromCharCode(65 + x);
+  s += '\n';
+  for (let y = 0; y < SIZE; y++) {
+    s += (SIZE - y).toString().padStart(2) + ' ';
+    for (let x = 0; x < SIZE; x++) s += board[x][y] === BLACK ? 'X' : board[x][y] === WHITE ? 'O' : '.';
+    s += '\n';
+  }
+  return s + '(X黑 O白 .空)';
+}
+
+// ---- 流式对话 ----
+async function streamChat(messages, model, role) {
+  const apiKey = localStorage.getItem('deepseek_key');
+  if (!apiKey) { addChat('ai', '<i>未配置 API Key，解说/对话不可用。请点击右上「API 设置」。</i>'); return; }
+  stopStream = false; stopBtn.disabled = false; chatStatus.textContent = '生成中…';
+  const msgEl = addChat(role, '');
+  const isReasoner = model === 'deepseek-reasoner';
+  let text = '', reasoning = '';
+  try {
+    const resp = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, stream: true })
+    });
+    if (!resp.ok) { const e = await resp.text(); addChat('ai', `<i>API 错误 ${resp.status}：${e.slice(0, 100)}</i>`); return; }
+    const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    while (true) {
+      if (stopStream) break;
+      const { done, value } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim(); if (data === '[DONE]') continue;
+        try {
+          const j = JSON.parse(data);
+          const delta = j.choices[0]?.delta || {};
+          if (delta.reasoning_content) { reasoning += delta.reasoning_content; renderMsg(msgEl, text, isReasoner ? reasoning : ''); }
+          if (delta.content) { text += delta.content; renderMsg(msgEl, text, isReasoner ? reasoning : ''); }
+        } catch (e) {}
       }
-      lines.push(row);
     }
-    return lines.join('\n');
+  } catch (e) { addChat('ai', `<i>网络错误：${e.message}</i>`); }
+  finally { stopBtn.disabled = true; chatStatus.textContent = '就绪'; chatHistory.push({ role, content: text }); }
+}
+
+function renderMsg(el, text, reasoning) {
+  const t = marked.parse(text || (reasoning ? '' : '…'));
+  const r = reasoning ? `<details class="thinking"><summary>💭 思考过程</summary>${marked.parse(reasoning)}</details>` : '';
+  el.querySelector('.msg-text').innerHTML = r + t;
+  chatBody.scrollTop = chatBody.scrollHeight;
+}
+
+function addChat(role, html) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.innerHTML = `<div class="msg-author">${role === 'ai' ? 'AI 解说' : '你'}</div><div class="msg-text">${html}</div>`;
+  chatBody.appendChild(div);
+  chatBody.scrollTop = chatBody.scrollHeight;
+  return div;
+}
+
+function showToast(msg, err) {
+  toast.textContent = msg; toast.className = 'toast show' + (err ? ' err' : '');
+  setTimeout(() => toast.classList.remove('show'), 2200);
+}
+
+// ---- 控件事件 ----
+document.getElementById('undoBtn').onclick = () => {
+  if (history.length === 0) return;
+  // AI 回合悔两步（撤回 AI 的落子 + 自己的落子）
+  let steps = (document.getElementById('aiEnable').checked && currentPlayer === BLACK && history.length >= 2) ? 2 : 1;
+  for (let i = 0; i < steps && history.length; i++) {
+    const h = history.pop();
+    board = h.board; currentPlayer = h.player; koPoint = h.ko;
+    immortalMap = h.state.immortalMap; sideImmortal = h.state.sideImmortal;
+    passCount = h.passCount; lastMove = h.lastMove; winLine = h.winLine;
   }
-  function patternText(p) {
-    if (!p || Object.keys(p).length === 0) return '无';
-    return Object.entries(p).map(([k, v]) => `${k}×${v}`).join('，');
-  }
+  gameOver = false; marks = []; drawBoard(); updateSituation();
+  // 撤回图表
+  for (let i = 0; i < steps; i++) { chartData.labels.pop(); chartData.black.pop(); chartData.white.pop(); }
+  if (chart) { chart.data.labels = chartData.labels; chart.data.datasets[0].data = chartData.black.map(compress); chart.data.datasets[1].data = chartData.white.map(compress); chart.update('none'); }
+};
+document.getElementById('passBtn').onclick = () => { if (!aiThinking && !gameOver) doMove(0, 0, true); };
+document.getElementById('restartBtn').onclick = () => restart();
+document.getElementById('analyzeBtn').onclick = () => analyzeBest();
+document.getElementById('clearMarksBtn').onclick = () => { marks = []; winLine = null; drawBoard(); };
+document.getElementById('sendBtn').onclick = sendChat;
+chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); } });
+stopBtn.onclick = () => { stopStream = true; };
 
-  function buildContext(extra) {
-    const ev = GA.evaluate(State.board);
-    const last = State.history[State.history.length - 1];
-    const toMove = State.over ? '—' : (State.current === BLACK ? '黑方' : '白方');
-    return `【实时棋局数据】
-轮到：${toMove}${State.over ? '（对局已结束）' : ''}
-总手数：${State.history.length}
-当前积分：黑 ${ev.black} / 白 ${ev.white}（${ev.net > 0 ? '黑方优势 +' + ev.net : ev.net < 0 ? '白方优势 +' + (-ev.net) : '均势'}）
-黑方棋型：${patternText(ev.blackPatterns)}
-白方棋型：${patternText(ev.whitePatterns)}
-${extra || ''}
-【棋盘 15×15】（行从上到下=15→1，列=A→O；X=黑 O=白 .=空）
-${boardText()}`;
-  }
+function sendChat() {
+  const q = chatInput.value.trim(); if (!q) return;
+  chatInput.value = '';
+  addChat('user', q);
+  const ev = GoImmortal.evaluate(board, immortalMap, rules);
+  const sys = `你是围棋·五子不朽游戏的 AI 助手。基于当前棋局回答。当前：黑${ev.black}目/白${ev.white}目，不朽块${immortalMap.size}子。棋盘：\n${boardTextForAI()}`;
+  streamChat([{ role: 'system', content: sys }, { role: 'user', content: q }], document.getElementById('modelSelect').value, 'ai');
+}
 
-  const SYS_COMMENTARY = `你是资深五子棋解说助手，根据实时棋局数据点评刚落下的一步棋。
-严格要求：
-1. 简短：通常 1-3 句话，最多 4 句。若该手平淡、无值得点评之处，一句话带过即可，不要硬凑。
-2. 客观如实：好棋才肯定，问题手就指出并给出更优建议；绝不可把孤立无援、脱离战场或明显的问题手说成"妙手/好棋/精妙"。
-3. 结合数据：可引用推荐点(Top5)、双方积分形势、棋型(活三/冲四/活四等)。
-4. 当落子不在推荐 Top5 时，委婉指出并建议更优位置（给出坐标）。
-5. 中文，口吻自然简洁，不堆砌套话，不滥用感叹号。`;
+function restart() {
+  board = GoImmortal.emptyBoard(); currentPlayer = BLACK; history = []; koPoint = null;
+  passCount = 0; gameOver = false; marks = []; lastMove = null; winLine = null;
+  immortalMap = new Map(); sideImmortal = new Set(); aiThinking = false;
+  chartData = { labels: [], black: [], white: [] };
+  if (chart) { chart.data.labels = []; chart.data.datasets[0].data = []; chart.data.datasets[1].data = []; chart.update(); }
+  drawBoard(); updateSituation();
+  addChat('ai', '🔄 新对局开始。黑方先行。');
+}
 
-  const SYS_CHAT = `你是五子棋对话助手，基于提供的实时棋局数据回答用户问题。
-要求：简明准确，结合实时棋型/积分/推荐点；不要无中生有；不要过度吹捧；用中文。若问题与棋局无关，可礼貌引导回棋局。`;
+// ---- 规则设置 ----
+document.getElementById('rulesBtn').onclick = () => document.getElementById('rulesModal').classList.add('show');
+document.getElementById('closeRules').onclick = () => document.getElementById('rulesModal').classList.remove('show');
+document.getElementById('applyRules').onclick = () => {
+  const a = document.getElementById('ruleMaxSize').checked;
+  const b = document.getElementById('ruleNoAdj').checked;
+  const c = document.getElementById('ruleOneImmortal').checked;
+  const d = document.getElementById('ruleStoneNoScore').checked;
+  if (!a && !b && !c && !d) { document.getElementById('ruleMsg').textContent = '至少启用一项'; document.getElementById('ruleMsg').className = 'test-result err'; return; }
+  rules = { maxImmortalSize: a ? 20 : null, noAdjImmortal: b, oneImmortalPerSide: c, stoneNoScore: d };
+  document.getElementById('ruleMsg').textContent = '已应用 ✓'; document.getElementById('ruleMsg').className = 'test-result ok';
+  setTimeout(() => document.getElementById('rulesModal').classList.remove('show'), 800);
+};
 
-  async function callStream(messages, onToken, onReason, onDone, onError) {
-    if (!AI.apiKey) { onError(new Error('NO_KEY')); return; }
-    AI.ctrl = new AbortController();
-    chatStatus.textContent = '生成中…'; chatStatus.classList.add('busy');
-    stopBtn.disabled = false;
-    try {
-      const resp = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + AI.apiKey },
-        signal: AI.ctrl.signal,
-        body: JSON.stringify({ model: AI.model, messages, stream: true }),
-      });
-      if (!resp.ok) {
-        const t = await resp.text();
-        throw new Error('HTTP ' + resp.status + ' ' + t.slice(0, 200));
+// ---- API 设置 ----
+document.getElementById('settingsBtn').onclick = () => { document.getElementById('apiKeyInput').value = localStorage.getItem('deepseek_key') || ''; document.getElementById('settingsModal').classList.add('show'); };
+document.getElementById('closeSettings').onclick = () => document.getElementById('settingsModal').classList.remove('show');
+document.getElementById('saveKeyBtn').onclick = () => { localStorage.setItem('deepseek_key', document.getElementById('apiKeyInput').value.trim()); showToast('API Key 已保存'); document.getElementById('settingsModal').classList.remove('show'); };
+document.getElementById('testBtn').onclick = async () => {
+  const k = document.getElementById('apiKeyInput').value.trim();
+  const el = document.getElementById('testResult');
+  el.textContent = '测试中…'; el.className = 'test-result';
+  try {
+    const r = await fetch('https://api.deepseek.com/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${k}` }, body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 }) });
+    el.textContent = r.ok ? '✓ 连接成功' : `✗ 失败 ${r.status}`; el.className = 'test-result ' + (r.ok ? 'ok' : 'err');
+  } catch (e) { el.textContent = '✗ ' + e.message; el.className = 'test-result err'; }
+};
+
+// ---- 折线图 ----
+function initChart() {
+  const cctx = document.getElementById('sitChart').getContext('2d');
+  chart = new Chart(cctx, {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: '黑方', data: [], borderColor: '#888', backgroundColor: 'rgba(50,50,50,.15)', tension: 0.3, pointRadius: 2 },
+      { label: '白方', data: [], borderColor: '#f5f5f5', backgroundColor: 'rgba(245,245,245,.1)', tension: 0.3, pointRadius: 2 }
+    ]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#e4e7eb', font: { size: 11 } } }, tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}：${Math.round(Math.expm1(Math.abs(ctx.parsed.y)) * Math.sign(ctx.parsed.y))} 目` } } },
+      scales: {
+        x: { ticks: { color: '#8b95a3', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,.05)' } },
+        y: { title: { display: true, text: '目数（对数压缩）', color: '#8b95a3', font: { size: 10 } }, ticks: { color: '#8b95a3', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,.05)' } }
       }
-      const reader = resp.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const ln of lines) {
-          const s = ln.trim();
-          if (!s.startsWith('data:')) continue;
-          const data = s.slice(5).trim();
-          if (data === '[DONE]') { onDone(); return; }
-          try {
-            const j = JSON.parse(data);
-            const delta = j.choices && j.choices[0] && j.choices[0].delta;
-            if (!delta) continue;
-            if (delta.reasoning_content) onReason(delta.reasoning_content);
-            if (delta.content) onToken(delta.content);
-          } catch (e) { /* ignore */ }
-        }
-      }
-      onDone();
-    } catch (e) {
-      if (e.name === 'AbortError') onDone(true);
-      else onError(e);
-    } finally {
-      AI.ctrl = null;
-      chatStatus.textContent = '就绪'; chatStatus.classList.remove('busy');
-      stopBtn.disabled = true;
     }
-  }
-
-  // 解说
-  async function runCommentary(moveInfo, ev) {
-    if (!AI.apiKey) {
-      addMsg('ai', `<span class="move-tag normal">第${State.history.length}手</span> ${moveInfo.player === BLACK ? '黑' : '白'}${moveInfo.coord}（未配置 API Key，跳过 AI 解说。点击右上角「API 设置」配置 DeepSeek Key 后即可启用。）`);
-      return;
-    }
-    const mover = moveInfo.player;
-    const cls = GA.classifyMove(State.board, { x: moveInfo.x, y: moveInfo.y }, mover);
-    const top5Str = moveInfo.preTop5.map((r, i) => `${i + 1}. ${coordOf(r.x, r.y)}(${r.score})`).join('  ');
-    const inTopTxt = moveInfo.inTop >= 0 ? `是（推荐第${moveInfo.inTop + 1}位）` : '否';
-    const ctxText = buildContext(`刚落子：${moveInfo.coord}（${mover === BLACK ? '黑' : '白'}）
-本手类型：${cls.label}（进攻增益 ${cls.myGain}，削弱对方 ${cls.oppLoss}${cls.isolated ? '，孤立无援' : ''}）
-是否在推荐Top5：${inTopTxt}
-推荐落点Top5：${top5Str}`);
-
-    const el = addMsg('ai', '', true);
-    const tagCls = cls.type === 'win' ? 'win' : cls.type;
-    el.querySelector('.msg-author').innerHTML = `AI 解说 <span class="move-tag ${tagCls}">${moveInfo.coord} · ${cls.label}</span>`;
-    const txtEl = el.querySelector('.msg-text');
-    let thinkEl = null;
-    let acc = '';
-    let reason = '';
-
-    await callStream(
-      [{ role: 'system', content: SYS_COMMENTARY }, { role: 'user', content: ctxText }],
-      (t) => { acc += t; renderStream(txtEl, acc, true); },
-      (r) => {
-        if (!thinkEl) { thinkEl = makeThinking(el); }
-        reason += r; thinkEl.querySelector('.think-body').textContent = reason;
-        scrollChat();
-      },
-      (aborted) => {
-        if (aborted) { acc += '\n\n（已停止）'; }
-        renderStream(txtEl, acc, false);
-        scrollChat();
-      },
-      (e) => {
-        txtEl.innerHTML = `<span style="color:var(--bad)">解说失败：${e.message}</span>`;
-      }
-    );
-  }
-
-  // 对话
-  async function runChat(text) {
-    addMsg('user', escapeHtml(text));
-    chatInput.value = ''; autoGrow();
-    if (!AI.apiKey) {
-      addMsg('ai', '未配置 API Key，无法对话。请点击右上角「API 设置」配置 DeepSeek API Key。');
-      return;
-    }
-    const ctxText = buildContext('用户提问：' + text);
-    const el = addMsg('ai', '', true);
-    const txtEl = el.querySelector('.msg-text');
-    let thinkEl = null; let acc = ''; let reason = '';
-    await callStream(
-      [{ role: 'system', content: SYS_CHAT }, { role: 'user', content: ctxText }],
-      (t) => { acc += t; renderStream(txtEl, acc, true); },
-      (r) => { if (!thinkEl) thinkEl = makeThinking(el); reason += r; thinkEl.querySelector('.think-body').textContent = reason; scrollChat(); },
-      (aborted) => { if (aborted) acc += '\n\n（已停止）'; renderStream(txtEl, acc, false); scrollChat(); },
-      (e) => { txtEl.innerHTML = `<span style="color:var(--bad)">对话失败：${e.message}</span>`; }
-    );
-  }
-
-  function renderStream(el, text, streaming) {
-    try { el.innerHTML = marked.parse(text) + (streaming ? '<span class="cursor"></span>' : ''); }
-    catch { el.textContent = text; }
-    scrollChat();
-  }
-  function makeThinking(msgEl) {
-    const t = document.createElement('details');
-    t.className = 'thinking'; t.open = isPro();
-    t.innerHTML = `<summary>思考过程（${MODEL_NAME[AI.model]}）<span class="twirl">▸</span></summary><div class="think-body"></div>`;
-    msgEl.querySelector('.msg-text').before(t);
-    return t;
-  }
-
-  // ---------- 消息 DOM ----------
-  function addMsg(role, html, withText) {
-    const el = document.createElement('div');
-    el.className = 'msg ' + role;
-    el.innerHTML = `<div class="msg-author">${role === 'ai' ? 'AI 解说' : '我'}</div><div class="msg-text">${withText ? '' : html}</div>`;
-    chatBody.appendChild(el);
-    scrollChat();
-    return el;
-  }
-  function scrollChat() { chatBody.scrollTop = chatBody.scrollHeight; }
-  function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-
-  // ---------- 控件 ----------
-  $('undoBtn').onclick = () => {
-    if (State.history.length === 0) { toast('没有可悔的棋'); return; }
-    if (AI.ctrl) AI.ctrl.abort();
-    const last = State.history.pop();
-    State.board[last.x][last.y] = 0;
-    State.over = false; State.winner = 0; State.winLine = null;
-    State.current = last.player;
-    State.marks = [];
-    State.scoreHistory.pop();
-    const ev = GA.evaluate(State.board);
-    updateSituation(ev);
-    refreshChart();
-    draw();
-    addMsg('ai', `已悔棋：撤回 ${last.player === BLACK ? '黑' : '白'}${coordOf(last.x, last.y)}。轮到 ${State.current === BLACK ? '黑方' : '白方'} 落子。`);
-  };
-
-  $('restartBtn').onclick = () => {
-    if (AI.ctrl) AI.ctrl.abort();
-    State.board = emptyBoard(); State.history = []; State.current = BLACK;
-    State.over = false; State.winner = 0; State.winLine = null; State.marks = [];
-    State.scoreHistory = [{ move: 0, black: 0, white: 0, net: 0 }];
-    updateSituation(GA.evaluate(State.board));
-    refreshChart();
-    draw();
-    addMsg('ai', '棋盘已重置，黑方先行。开始新对局。');
-  };
-
-  $('analyzeBtn').onclick = () => {
-    if (State.over) { toast('对局已结束'); return; }
-    const rec = GA.recommend(State.board, State.current);
-    State.marks = rec.map((r, i) => ({ x: r.x, y: r.y, rank: i + 1, score: r.score }));
-    draw();
-    const lines = rec.map((r, i) => `<b>${i + 1}. ${coordOf(r.x, r.y)}</b>（评分 ${r.score}，进攻 ${r.myGain} / 防守 ${r.oppGain}）`).join('<br>');
-    addMsg('ai', `当前轮到 <b>${State.current === BLACK ? '黑方' : '白方'}</b>，程序分析最优 5 个落点：<br>${lines}`);
-  };
-
-  $('clearMarksBtn').onclick = () => { State.marks = []; draw(); toast('已清除标记'); };
-
-  // 模型切换
-  modelSelect.onchange = () => {
-    AI.model = modelSelect.value;
-    localStorage.setItem('ds_model', AI.model);
-    toast('已切换为 ' + MODEL_NAME[AI.model]);
-  };
-
-  // 停止
-  stopBtn.onclick = () => { if (AI.ctrl) AI.ctrl.abort(); };
-
-  // 发送
-  sendBtn.onclick = () => {
-    const t = chatInput.value.trim();
-    if (!t) return;
-    runChat(t);
-  };
-  chatInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendBtn.click(); }
   });
-  function autoGrow() { chatInput.style.height = 'auto'; chatInput.style.height = Math.min(120, chatInput.scrollHeight) + 'px'; }
-  chatInput.addEventListener('input', autoGrow);
+}
 
-  // ---------- API 设置弹窗 ----------
-  const modal = $('settingsModal');
-  $('settingsBtn').onclick = () => { $('apiKeyInput').value = AI.apiKey; modal.classList.add('show'); };
-  $('closeSettings').onclick = () => modal.classList.remove('show');
-  modal.onclick = (e) => { if (e.target === modal) modal.classList.remove('show'); };
-  $('saveKeyBtn').onclick = () => {
-    AI.apiKey = $('apiKeyInput').value.trim();
-    localStorage.setItem('ds_api_key', AI.apiKey);
-    modal.classList.remove('show');
-    toast(AI.apiKey ? 'API Key 已保存' : '已清除 API Key');
-  };
-  $('testBtn').onclick = async () => {
-    const key = $('apiKeyInput').value.trim();
-    const r = $('testResult');
-    if (!key) { r.textContent = '请先输入 Key'; r.className = 'test-result err'; return; }
-    r.textContent = '测试中…'; r.className = 'test-result';
-    try {
-      const resp = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-        body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 5, stream: false }),
-      });
-      if (resp.ok) { r.textContent = '✓ 连接成功，Key 有效'; r.className = 'test-result ok'; }
-      else { const t = await resp.text(); r.textContent = '✗ 失败 ' + resp.status; r.className = 'test-result err'; }
-    } catch (e) { r.textContent = '✗ 网络错误'; r.className = 'test-result err'; }
-  };
-
-  // ---------- toast ----------
-  let toastT;
-  function toast(msg) {
-    const t = $('toast'); t.textContent = msg; t.classList.add('show');
-    clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 1800);
-  }
-
-  // ---------- 启动 ----------
-  window.addEventListener('resize', resizeCanvas);
-  initChart();
-  resizeCanvas();
-  updateSituation(GA.evaluate(State.board));
-})();
+// ---- 启动 ----
+initChart();
+drawBoard();
+updateSituation();
