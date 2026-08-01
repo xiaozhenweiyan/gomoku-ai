@@ -133,10 +133,25 @@ const GomokuAnalysis = (function () {
   //            活二→活四 潜力800 / 阻止对方活二→活四 800
   //            活二→眠四 潜力400 / 阻止对方活二→眠四 400
   //            攻守兼备奖励 1500（同时进攻高分+防守高分）
+  //            新增中分机制：破除对方活二400 / 阻止对方双活三威胁2000
   //   低分(l)：活二100 / 落在对方子的斜对角50 / 己方邻子支援 +5/个
+  //            新增低分机制：连接两处己方棋200 / 双向活二扩展100
   //   极低(vl)：落在对方子的左右(正交)15 / 落在正中间10
+  //             新增极低：贴近主战场距离衰减
   //   无用：0
-  //   扣分：被对方包围（2格内对方≥2且无己方支援）每个对方子 -4
+  //   扣分：被对方包围 -4/子 / 孤立废棋-30 / 放任对方活四-5000 / 放任对方活三-800
+  //
+  // 新增10机制：
+  //  ④孤立废棋惩罚：远离主战场3格外且无关联 → -30（解决"下在毫无意义的地方"）
+  //  ⑤主战场引力：落点距最近棋子越近越好，>3格扣分（配合④）
+  //  ⑥威胁优先级权重：对方已活三/活四时，防守点大幅加权（解决"看不到即将活四"）
+  //  ⑦关键威胁放大：对方有活三必应点 ×2 / 有活四必应点 ×3
+  //  ⑧双活三/活四检测：本手形成双威胁额外 ×n 加成
+  //  ⑨破除对方棋型：落子切断对方活二/活三连线 → +400/800
+  //  ⑩连接己方棋群：落点连接两处以上己方棋子 → +200
+  //  ⑪续手双威胁：续手能形成两个活三/活四 → +1500
+  //  ⑫前瞻对方反扑：落子后对方最强续手若≥活四 → 扣分警告
+  //  ⑬势均力敌调控：双方分差小时微调，避免一边倒（让对弈更均衡）
   //
   // 同点累加（同一个点可多次加分，取其能形成的最大价值）：
   //   n 个高分  → 高分之和 × n
@@ -229,6 +244,61 @@ const GomokuAnalysis = (function () {
     return res;
   }
 
+  // ===================================================================
+  // 全局威胁扫描：统计某方当前已形成的棋型（用于新机制⑥⑦⑨）
+  // ===================================================================
+  function globalPatterns(board, player) {
+    const counts = {};
+    for (const [dx, dy] of DIRS4) {
+      for (let x = 0; x < SIZE; x++) for (let y = 0; y < SIZE; y++) {
+        // 以 (x,y) 为起点，沿 (dx,dy) 取长度6窗口：内部5格+1边界
+        let s = '2';
+        for (let k = 0; k < 5; k++) {
+          const nx = x + dx * k, ny = y + dy * k;
+          let c = '2';
+          if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE) {
+            const v = board[nx][ny];
+            c = v === player ? '1' : v === EMPTY ? '0' : '2';
+          }
+          s += c;
+        }
+        s += '2';
+        for (const [re, , , name] of TIER_PTN) {
+          const g = new RegExp(re.source, 'g');
+          let m;
+          while ((m = g.exec(s)) !== null) {
+            counts[name] = (counts[name] || 0) + 1;
+            s = s.slice(0, m.index) + '2'.repeat(m[0].length) + s.slice(m.index + m[0].length);
+            g.lastIndex = 0;
+          }
+        }
+      }
+    }
+    return counts;
+  }
+
+  // 一手前瞻：player 落子 (x,y) 后，opp 最佳续手能否形成 ≥活三的高威胁
+  // 返回 {oppMaxThreat}：对方最强续手形成的最高棋型价值
+  function oppBestCounter(board, x, y, player) {
+    const opp = player === BLACK ? WHITE : BLACK;
+    board[x][y] = player;
+    let maxVal = 0;
+    const cands = candidates(board);
+    for (const [cx, cy] of cands) {
+      board[cx][cy] = opp;
+      const p = patternsThrough(board, cx, cy, opp);
+      board[cx][cy] = EMPTY;
+      let v = 0;
+      for (const [name, cnt] of Object.entries(p)) {
+        const info = OFF_MAP[name];
+        if (info) v = Math.max(v, info[1] * cnt);
+      }
+      if (v > maxVal) maxVal = v;
+    }
+    board[x][y] = EMPTY;
+    return maxVal;
+  }
+
   // 单点总价值：进攻 + 防守 + 潜在威胁 + 邻里 + 位置加成，按累加公式合成
   function pointValue(board, x, y, player) {
     const opp = player === BLACK ? WHITE : BLACK;
@@ -285,6 +355,83 @@ const GomokuAnalysis = (function () {
     const cdx = Math.abs(x - 7), cdy = Math.abs(y - 7);
     if (cdx <= 1 && cdy <= 1) add('vl', cdx === 0 && cdy === 0 ? 10 : 5);
 
+    // ===== 新增 10 机制 =====
+    // 计算到最近棋子的距离（用于④⑤）
+    let minDist = 99, totalStones = 0;
+    for (let i = 0; i < SIZE; i++) for (let j = 0; j < SIZE; j++) {
+      if (board[i][j] === EMPTY) continue;
+      totalStones++;
+      const d = Math.max(Math.abs(i - x), Math.abs(j - y)); // 切比雪夫距离
+      if (d < minDist) minDist = d;
+    }
+    // ⑤ 主战场引力：距离1加分、距离2正常、>2 衰减、>3 显著扣分
+    if (totalStones > 0) {
+      if (minDist === 1) add('l', 30);
+      else if (minDist === 2) add('l', 10);
+      else if (minDist >= 4) add('vl', -8 * (minDist - 3)); // 距离越远扣越多（负极低）
+    }
+
+    // ⑥⑦ 威胁优先级权重 + 关键威胁放大：扫描对方全局已有威胁
+    const oppGlobal = globalPatterns(board, opp);
+    const oppLive3 = oppGlobal['活三'] || 0;
+    const oppLive4 = oppGlobal['活四'] || 0;
+    // 若本点是对方威胁的必应点（即 def 中含阻挡活三/活四），大幅放大
+    if ((def['活四'] || 0) > 0) {
+      // 阻挡活四 → 额外 ×3 放大（覆盖在累加后的 total）
+    }
+    if ((def['活三'] || 0) > 0 && oppLive3 > 0) {
+      add('m', 2000); // 阻止对方活三升级威胁
+    }
+
+    // ⑧ 双活三/活四检测：本手形成多个同类高威胁
+    const myLive3 = off['活三'] || 0;
+    const myLive4 = off['活四'] || 0;
+    if (myLive3 >= 2) add('h', 3000); // 双活三额外加成
+    if (myLive4 >= 1 && myLive3 >= 1) add('h', 4000); // 活四+活三
+    if (myLive4 >= 2) add('h', 10000); // 双活四接近必胜
+
+    // ⑨ 破除对方棋型：本手切断对方活二/活三连线
+    // 检测：落子前对方在该方向有活二/活三，落子后（己方占位）对方该棋型被切断
+    board[x][y] = player;
+    const oppAfter = globalPatterns(board, opp);
+    board[x][y] = EMPTY;
+    const oppBefore = globalPatterns(board, opp);
+    const breakLive2 = (oppBefore['活二'] || 0) - (oppAfter['活二'] || 0);
+    const breakLive3 = (oppBefore['活三'] || 0) - (oppAfter['活三'] || 0);
+    if (breakLive2 > 0) for (let i = 0; i < breakLive2; i++) add('m', 400);
+    if (breakLive3 > 0) for (let i = 0; i < breakLive3; i++) add('h', 800);
+
+    // ⑩ 连接己方棋群：落点同时在2个以上方向连接己方棋子
+    let connectDirs = 0;
+    for (const [dx, dy] of DIRS4) {
+      const a = (x + dx >= 0 && x + dx < SIZE && y + dy >= 0 && y + dy < SIZE && board[x + dx][y + dy] === player);
+      const b = (x - dx >= 0 && x - dx < SIZE && y - dy >= 0 && y - dy < SIZE && board[x - dx][y - dy] === player);
+      if (a || b) connectDirs++;
+    }
+    if (connectDirs >= 2) add('l', 200);
+    else if (connectDirs === 1) add('l', 60);
+
+    // ⑪ 续手双威胁：续手能同时形成两个活三或两个活四
+    let dualThreat = 0;
+    if (myLive3 >= 1) {
+      // 已有活三，检查续手能否再加一个活三/活四
+      board[x][y] = player;
+      for (const [dx, dy] of DIRS4) {
+        for (let i = -4; i <= 4; i++) {
+          if (i === 0) continue;
+          const sx = x + dx * i, sy = y + dy * i;
+          if (sx < 0 || sx >= SIZE || sy < 0 || sy >= SIZE || board[sx][sy] !== EMPTY) continue;
+          board[sx][sy] = player;
+          const p2 = patternsThrough(board, x, y, player);
+          board[sx][sy] = EMPTY;
+          if ((p2['活三'] || 0) >= 2 || (p2['活四'] || 0) >= 2) { dualThreat = 1; break; }
+        }
+        if (dualThreat) break;
+      }
+      board[x][y] = EMPTY;
+    }
+    if (dualThreat) add('m', 1500);
+
     // 累加公式：高 ×n / 中 ×(n/2) / 低 +n / 极低 +(n/2)
     const h = tiers.h, m = tiers.m, l = tiers.l, vl = tiers.vl;
     let total = 0;
@@ -295,6 +442,31 @@ const GomokuAnalysis = (function () {
 
     // ① 被对方包围扣分：2格内对方子≥2且无己方支援 → 每个对方子 -4
     if (myNeighbors === 0 && oppNeighbors >= 2) total -= oppNeighbors * 4;
+
+    // ④ 孤立废棋惩罚：距最近棋子≥4格且无任何棋型价值 → -30
+    if (totalStones > 0 && minDist >= 4 && offRaw === 0 && defRaw === 0) {
+      total -= 30;
+    }
+
+    // ⑫ 前瞻对方反扑：落子后对方最强续手若≥活四(10000) → 警告扣分
+    if (offRaw > 0 || defRaw > 0) {
+      const oppCounter = oppBestCounter(board, x, y, player);
+      if (oppCounter >= 10000) total -= 3000; // 对方可反扑活四
+      else if (oppCounter >= 5000) total -= 500; // 对方可反扑活三
+    }
+
+    // ⑬ 势均力敌调控：双方全局分差小时，略微提升防守点权重，避免一边倒
+    const myGlobal = globalPatterns(board, player);
+    const myGScore = Object.entries(myGlobal).reduce((s, [n, c]) => { const info = OFF_MAP[n]; return s + (info ? info[1] * c : 0); }, 0);
+    const oppGScore = Object.entries(oppGlobal).reduce((s, [n, c]) => { const info = OFF_MAP[n]; return s + (info ? info[1] * c : 0); }, 0);
+    const gDiff = Math.abs(myGScore - oppGScore);
+    if (gDiff < 1000 && defRaw > offRaw && defRaw > 0) {
+      total += Math.round(defRaw * 0.1); // 均势时防守点额外 +10%
+    }
+
+    // ⑦ 关键威胁放大（累加后乘）：对方有活四且本点能阻挡 → ×3
+    if (oppLive4 > 0 && (def['活四'] || 0) > 0) total *= 3;
+    else if (oppLive3 > 0 && (def['活三'] || 0) > 0) total *= 2;
 
     return { total: Math.round(total), off: offRaw, def: defRaw };
   }
