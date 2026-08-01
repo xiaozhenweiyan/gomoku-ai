@@ -123,28 +123,139 @@ const GomokuAnalysis = (function () {
     return [...set].map(i => [i % SIZE, Math.floor(i / SIZE)]);
   }
 
-  // ---- Top5 推荐落点（当前轮到 player）----
-  // 落点价值 = 我方进攻增益 + 对方若占此点的进攻价值（防守价值）
-  function recommend(board, player, topN = 5) {
+  // ===================================================================
+  // Top5 推荐引擎（按用户优先级分层 + 同点多次累加规则）
+  //
+  // 分档与分值（由高到低）：
+  //   高分(h)：连五100000 / 阻挡连五99000 / 活四·阻挡活四10000 / 活三·阻挡活三5000
+  //   中分(m)：眠四·阻挡眠四1000 / 眠三·阻挡眠三500
+  //   低分(l)：活二100 / 落在对方子的斜对角50
+  //   极低(vl)：落在对方子的左右(正交)15 / 落在正中间10
+  //   无用：0
+  //
+  // 同点累加（同一个点可多次加分，取其能形成的最大价值）：
+  //   n 个高分  → 高分之和 × n
+  //   m 个中分  → 中分之和 × (m/2)
+  //   p 个低分  → 低分之和 + p
+  //   q 个极低  → 极低之和 + (q/2)
+  // ===================================================================
+  const DIRS4 = [[1, 0], [0, 1], [1, 1], [1, -1]];
+
+  // 棋型表（按优先级从高到低；匹配后用 '2' 覆盖，避免子模式重复计数）
+  // [正则, 分值, 档位, 名称]
+  const TIER_PTN = [
+    [/11111/,                                           100000, 'h', '连五'],
+    [/011110/,                                          10000,  'h', '活四'],
+    [/01110|010110|011010/,                             5000,   'h', '活三'],
+    [/011112|211110|10111|11011|11101/,                 1000,   'm', '眠四'],
+    [/21110|01112|210110|011012|211010|010112/,         500,    'm', '眠三'],
+    [/0110|01010|010010/,                               100,    'l', '活二'],
+  ];
+  // 进攻棋型 → (档位, 分值)
+  const OFF_MAP = { '连五': ['h', 100000], '活四': ['h', 10000], '活三': ['h', 5000], '眠四': ['m', 1000], '眠三': ['m', 500], '活二': ['l', 100] };
+  // 防守棋型（对方在此能形成的棋型 → 我方阻挡的价值）→ (档位, 分值)
+  const DEF_MAP = { '连五': ['h', 99000], '活四': ['h', 10000], '活三': ['h', 5000], '眠四': ['m', 1000], '眠三': ['m', 500] };
+
+  // 9 格窗口（中心为落子点），两端补 '2'；返回长度 11，落子点在索引 5
+  function windowStr(board, x, y, player, dx, dy) {
+    let s = '2';
+    for (let i = -4; i <= 4; i++) {
+      const nx = x + dx * i, ny = y + dy * i;
+      let c = '2';
+      if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE) {
+        const v = board[nx][ny];
+        c = v === player ? '1' : v === EMPTY ? '0' : '2';
+      }
+      s += c;
+    }
+    return s + '2';
+  }
+  const WC = 5; // 窗口中落子点的索引
+
+  // 检测 (x,y) 落子后该子"参与形成"的所有棋型（4 个方向，仅统计包含中心点的匹配）
+  function patternsThrough(board, x, y, player) {
+    const counts = {};
+    for (const [dx, dy] of DIRS4) {
+      let s = windowStr(board, x, y, player, dx, dy);
+      for (const [re, , , name] of TIER_PTN) {
+        const g = new RegExp(re.source, 'g');
+        let m;
+        while ((m = g.exec(s)) !== null) {
+          const hitCenter = m.index <= WC && m.index + m[0].length > WC;
+          if (hitCenter) counts[name] = (counts[name] || 0) + 1;
+          // 消费匹配区段（无论是否含中心），避免子模式重复计数
+          s = s.slice(0, m.index) + '2'.repeat(m[0].length) + s.slice(m.index + m[0].length);
+          g.lastIndex = 0;
+        }
+      }
+    }
+    return counts;
+  }
+
+  // 单点总价值：进攻 + 防守 + 位置加成，按累加公式合成
+  function pointValue(board, x, y, player) {
     const opp = player === BLACK ? WHITE : BLACK;
-    const base = evaluate(board);
-    const baseMine = player === BLACK ? base.black : base.white;
-    const baseOpp = player === BLACK ? base.white : base.black;
+    // 进攻：自己落子形成的棋型
+    board[x][y] = player;
+    const off = patternsThrough(board, x, y, player);
+    board[x][y] = EMPTY;
+    // 防守：对方若落子于此形成的棋型（= 我方阻挡掉的价值）
+    board[x][y] = opp;
+    const def = patternsThrough(board, x, y, opp);
+    board[x][y] = EMPTY;
+
+    const tiers = { h: { sum: 0, n: 0 }, m: { sum: 0, n: 0 }, l: { sum: 0, n: 0 }, vl: { sum: 0, n: 0 } };
+    const add = (tier, val) => { tiers[tier].sum += val; tiers[tier].n += 1; };
+
+    let offRaw = 0, defRaw = 0; // 原始进攻/防守分（用于 UI 展示）
+    for (const [name, cnt] of Object.entries(off)) { const info = OFF_MAP[name]; if (!info) continue; for (let i = 0; i < cnt; i++) { add(info[0], info[1]); offRaw += info[1]; } }
+    for (const [name, cnt] of Object.entries(def)) { const info = DEF_MAP[name]; if (!info) continue; for (let i = 0; i < cnt; i++) { add(info[0], info[1]); defRaw += info[1]; } }
+
+    // 位置加成
+    // 斜对角：4 个对角邻格有对方子 → 低分(50)
+    for (const [dx, dy] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && board[nx][ny] === opp) add('l', 50);
+    }
+    // 左右(正交邻格)：4 个正交邻格有对方子 → 极低(15)
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && board[nx][ny] === opp) add('vl', 15);
+    }
+    // 正中间：中心 3×3 区域 → 极低(正中10 / 一环5)
+    const cdx = Math.abs(x - 7), cdy = Math.abs(y - 7);
+    if (cdx <= 1 && cdy <= 1) add('vl', cdx === 0 && cdy === 0 ? 10 : 5);
+
+    // 累加公式：高 ×n / 中 ×(n/2) / 低 +n / 极低 +(n/2)
+    const h = tiers.h, m = tiers.m, l = tiers.l, vl = tiers.vl;
+    let total = 0;
+    if (h.n) total += h.sum * h.n;
+    if (m.n) total += m.sum * (m.n / 2);
+    if (l.n) total += l.sum + l.n;
+    if (vl.n) total += vl.sum + (vl.n / 2);
+    return { total: Math.round(total), off: offRaw, def: defRaw };
+  }
+
+  // ---- Top5 推荐落点（当前轮到 player）----
+  function recommend(board, player, topN = 5) {
     const cands = candidates(board);
+    const seen = new Set(cands.map(c => c[1] * SIZE + c[0]));
     const list = [];
     for (const [x, y] of cands) {
-      // 我方落子
-      board[x][y] = player;
-      const afterMine = evaluateBoard(board, player).score;
-      board[x][y] = EMPTY;
-      const myGain = afterMine - baseMine;
-      // 对方若落子于此（我方防守掉的价值）
-      board[x][y] = opp;
-      const afterOpp = evaluateBoard(board, opp).score;
-      board[x][y] = EMPTY;
-      const oppGain = afterOpp - baseOpp;
-      const value = myGain + oppGain;
-      list.push({ x, y, score: Math.round(value), myGain: Math.round(myGain), oppGain: Math.round(oppGain) });
+      const v = pointValue(board, x, y, player);
+      list.push({ x, y, score: v.total, myGain: v.off, oppGain: v.def });
+    }
+    // 候选不足 topN（如空盘）时补充中心 3×3 空点
+    if (list.length < topN) {
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+        const x = 7 + dx, y = 7 + dy;
+        if (x < 0 || x >= SIZE || y < 0 || y >= SIZE) continue;
+        const k = y * SIZE + x;
+        if (seen.has(k) || board[x][y] !== EMPTY) continue;
+        seen.add(k);
+        const v = pointValue(board, x, y, player);
+        list.push({ x, y, score: v.total, myGain: v.off, oppGain: v.def });
+      }
     }
     list.sort((a, b) => b.score - a.score);
     return list.slice(0, topN);
