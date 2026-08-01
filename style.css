@@ -57,6 +57,8 @@ body{min-height:100vh}
 .chart-box{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px}
 .chart-title{font-size:13px;color:var(--txt2);margin-bottom:8px}
 .chart-title small{color:var(--txt3);margin-left:6px;font-weight:400}
+.chart-canvas-wrap{position:relative;height:200px;width:100%}
+.chart-canvas-wrap canvas{position:absolute;inset:0;width:100%!important;height:100%!important}
 
 /* 对话区 */
 .chat-area{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);display:flex;flex-direction:column;height:calc(100vh - 110px);min-height:520px;overflow:hidden}

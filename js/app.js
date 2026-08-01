@@ -214,7 +214,7 @@
     const ev = GA.evaluate(State.board);
     State.scoreHistory.push({ move: State.history.length, black: ev.black, white: ev.white, net: ev.net });
     updateSituation(ev);
-    updateChart();
+    refreshChart();
 
     // 清除上轮分析标记
     State.marks = [];
@@ -254,6 +254,9 @@
   }
 
   // ---------- 折线图 ----------
+  // Y 轴对数压缩：sign(x)*log1p(|x|)，避免五连(100000)把刻度撑爆、普通手被压成一条线。
+  // tooltip 仍显示真实积分。
+  const compress = (v) => Math.sign(v) * Math.log1p(Math.abs(v));
   let chart;
   function initChart() {
     const c = $('sitChart').getContext('2d');
@@ -269,19 +272,31 @@
       options: {
         responsive: true, maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
-        plugins: { legend: { labels: { color: '#9aa1b1', boxWidth: 12, font: { size: 11 } } }, tooltip: { } },
+        plugins: {
+          legend: { labels: { color: '#9aa1b1', boxWidth: 12, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const idx = ctx.dataIndex;
+                const real = State.scoreHistory[idx];
+                const who = ctx.datasetIndex === 0 ? '黑方' : '白方';
+                return `${who}：${real ? (ctx.datasetIndex === 0 ? real.black : real.white) : 0} 分`;
+              },
+              title: (items) => '第 ' + items[0].label + ' 手',
+            },
+          },
+        },
         scales: {
           x: { ticks: { color: '#6b7180', maxTicksLimit: 12 }, grid: { color: 'rgba(255,255,255,.05)' }, title: { display: true, text: '手数', color: '#6b7180' } },
-          y: { ticks: { color: '#6b7180' }, grid: { color: 'rgba(255,255,255,.05)' }, title: { display: true, text: '积分', color: '#6b7180' } },
+          y: { ticks: { color: '#6b7180', callback: (v) => Math.round(v) }, grid: { color: 'rgba(255,255,255,.05)' }, title: { display: true, text: '积分（对数压缩）', color: '#6b7180' } },
         },
       },
     });
   }
-  function updateChart() {
-    const h = State.scoreHistory[State.scoreHistory.length - 1];
-    chart.data.labels.push(String(h.move));
-    chart.data.datasets[0].data.push(h.black);
-    chart.data.datasets[1].data.push(h.white);
+  function refreshChart() {
+    chart.data.labels = State.scoreHistory.map(h => String(h.move));
+    chart.data.datasets[0].data = State.scoreHistory.map(h => compress(h.black));
+    chart.data.datasets[1].data = State.scoreHistory.map(h => compress(h.white));
     chart.update('none');
   }
 
@@ -492,9 +507,7 @@ ${boardText()}`;
     State.scoreHistory.pop();
     const ev = GA.evaluate(State.board);
     updateSituation(ev);
-    // 图表回退
-    chart.data.labels.pop(); chart.data.datasets[0].data.pop(); chart.data.datasets[1].data.pop();
-    chart.update('none');
+    refreshChart();
     draw();
     addMsg('ai', `已悔棋：撤回 ${last.player === BLACK ? '黑' : '白'}${coordOf(last.x, last.y)}。轮到 ${State.current === BLACK ? '黑方' : '白方'} 落子。`);
   };
@@ -505,7 +518,7 @@ ${boardText()}`;
     State.over = false; State.winner = 0; State.winLine = null; State.marks = [];
     State.scoreHistory = [{ move: 0, black: 0, white: 0, net: 0 }];
     updateSituation(GA.evaluate(State.board));
-    chart.data.labels = ['0']; chart.data.datasets[0].data = [0]; chart.data.datasets[1].data = [0]; chart.update('none');
+    refreshChart();
     draw();
     addMsg('ai', '棋盘已重置，黑方先行。开始新对局。');
   };
