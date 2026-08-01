@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>五子棋 · AI 智能解说</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⚫⚪</span>
+      <h1>五子棋 <small>AI 智能解说</small></h1>
+    </div>
+    <div class="topbar-right">
+      <label class="model-switch" title="切换 AI 模型">
+        <select id="modelSelect">
+          <option value="deepseek-chat">V4 Flash · 快速</option>
+          <option value="deepseek-reasoner">V4 Pro · 深度思考</option>
+        </select>
+      </label>
+      <button id="settingsBtn" class="btn ghost">API 设置</button>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- 左：棋盘 + 分析 -->
+    <section class="board-area">
+      <div class="board-wrap" id="boardWrap">
+        <canvas id="board" width="600" height="600"></canvas>
+        <div class="hover-coord" id="hoverCoord"></div>
+      </div>
+
+      <!-- 实时形势条 -->
+      <div class="situation">
+        <div class="sit-label">
+          <span class="dot black"></span>黑方 <b id="blackScore">0</b>
+          <span class="sit-vs">vs</span>
+          <b id="whiteScore">0</b> 白方<span class="dot white"></span>
+        </div>
+        <div class="sit-bar">
+          <div class="sit-bar-black" id="sitBlack" style="width:50%"></div>
+          <div class="sit-bar-white" id="sitWhite" style="width:50%"></div>
+        </div>
+        <div class="sit-verdict" id="sitVerdict">均势 · 等待开局</div>
+      </div>
+
+      <!-- 控制按钮 -->
+      <div class="controls">
+        <button id="undoBtn" class="btn">↶ 悔棋</button>
+        <button id="restartBtn" class="btn">⟳ 重新开始</button>
+        <button id="analyzeBtn" class="btn primary">⚡ 分析最优下法</button>
+        <button id="clearMarksBtn" class="btn">✕ 清除标记</button>
+      </div>
+
+      <!-- 形势折线图 -->
+      <div class="chart-box">
+        <div class="chart-title">形势折线图 <small>每一手双方积分变化</small></div>
+        <canvas id="sitChart" height="170"></canvas>
+      </div>
+    </section>
+
+    <!-- 右：AI 对话 -->
+    <aside class="chat-area">
+      <div class="chat-head">
+        <span>💬 AI 解说与对话</span>
+        <span class="chat-status" id="chatStatus">就绪</span>
+      </div>
+      <div class="chat-body" id="chatBody">
+        <div class="msg ai">
+          <div class="msg-author">AI 解说</div>
+          <div class="msg-text">欢迎来到五子棋对弈。黑方先行，点击棋盘交叉点落子。每步我都会结合实时分析进行点评；右侧可随时向我提问。</div>
+        </div>
+      </div>
+      <div class="chat-input">
+        <button id="stopBtn" class="btn danger" disabled>■ 停止</button>
+        <textarea id="chatInput" rows="1" placeholder="向 AI 提问（基于当前棋局）… Enter 发送 / Shift+Enter 换行"></textarea>
+        <button id="sendBtn" class="btn primary">发送</button>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<!-- API 设置 弹窗 -->
+<div class="modal-mask" id="settingsModal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>API 设置</h3>
+      <button id="closeSettings" class="x">✕</button>
+    </div>
+    <div class="modal-body">
+      <label>DeepSeek API Key</label>
+      <input type="password" id="apiKeyInput" placeholder="sk-..." autocomplete="off" />
+      <div class="hint">密钥仅保存在你的浏览器本地（localStorage），不会上传到任何服务器。</div>
+      <div class="modal-row">
+        <button id="testBtn" class="btn">🔍 测试连接</button>
+        <span id="testResult" class="test-result"></span>
+      </div>
+      <div class="modal-row">
+        <button id="saveKeyBtn" class="btn primary">保存</button>
+      </div>
+      <div class="model-info">
+        模型映射：V4 Flash → <code>deepseek-chat</code> · V4 Pro → <code>deepseek-reasoner</code>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="js/analysis.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
